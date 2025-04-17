@@ -19,60 +19,70 @@ KubeSim simulates a Kubernetes-like cluster environment for educational purposes
 - **Frontend**: React with shadcn UI components and Chart.js
 - **Configuration**: Static `config.json` file (Kubernetes-style)
 
-## Setup Instructions
+## Getting Started
 
 ### Prerequisites
 
-- Docker
+- Docker & Docker Compose
 - Python 3.9+
 - Node.js/npm
 
-### Backend Setup
+### Setup
 
-1. Install Python dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
+1.  **Set up Python environment** (optional but recommended):
+    ```bash
+    python -m venv venv
+    source venv/bin/activate # On Windows use `venv\Scripts\activate`
+    ```
 
-2. Create Docker network:
-   ```
-   docker network create cluster-net
-   ```
+2.  **Install Python dependencies**:
+    ```bash
+    pip install -r requirements.txt
+    ```
 
-3. Build the node image:
-   ```
-   docker build -t node_image .
-   ```
+3.  **Install frontend dependencies**:
+    ```bash
+    cd kubesim
+    npm install
+    cd ..
+    ```
 
-4. Create data directory:
-   ```
-   sudo mkdir -p /var/cluster-data
-   sudo chmod 777 /var/cluster-data
-   ```
+### Building the Node Image
 
-5. Start the Flask API server:
-   ```
-   python app.py
-   ```
+Build the Docker image required for the cluster nodes:
 
-### Frontend Setup
+```bash
+./start.sh build
+```
 
-1. Navigate to the React app directory:
-   ```
-   cd kubesim
-   ```
+### Running the Application
 
-2. Install dependencies:
-   ```
-   npm install
-   ```
+1.  **Start the Backend**:
+    This script will start the main Flask API server and ensure the necessary Docker network is created.
+    ```bash
+    ./start.sh 
+    ```
 
-3. Start the development server:
-   ```
-   npm start
-   ```
+2.  **Start the Frontend**:
+    Navigate to the `kubesim` directory and run the frontend start script:
+    ```bash
+    ./start-frontend.sh 
+    ```
 
-4. Access the UI at http://localhost:3000
+## Running Tests
+
+There are two sets of tests available:
+
+1.  **Mocked Tests**: These use `unittest` and mocks to test application logic without running the full system.
+    ```bash
+    python -m tests.run_tests
+    ```
+
+2.  **Real Application Tests**: These launch the actual backend and Docker containers to test real-world scenarios. **Ensure Docker is running and the node image is built (`./start.sh build`) before running these.**
+    ```bash
+    python -m tests.run_real_tests
+    ```
+    See `tests/README.md` for more details on the specific real tests.
 
 ## Features
 
@@ -80,7 +90,7 @@ KubeSim simulates a Kubernetes-like cluster environment for educational purposes
 - **Pod Scheduling**: Schedule pods (threads) on nodes using configurable algorithms
 - **Resource Monitoring**: Track CPU usage across nodes and pods
 - **Health Checks**: Detect unhealthy nodes and pods
-- **Auto-Scaling**: Automatically scale the cluster based on resource usage
+- **Auto-Scaling**: ⚠️ **Caution: The auto-scaling feature is still under construction. It is recommended not to use it until the upcoming update.**
 - **Interactive UI**: Visualize cluster state, resource usage, and pod distribution
 
 ## API Endpoints
@@ -97,7 +107,9 @@ Edit `config.json` to configure:
 
 - `AUTO_SCALE` (boolean): Enable/disable auto-scaling
 - `SCHEDULING_ALGO` (string): Choose scheduling algorithm ("first-fit", "best-fit", "worst-fit")
+- `DEFAULT_NODE_CAPACITY`: Default CPU cores per node.
+- `AUTO_SCALE_HIGH_THRESHOLD`, `AUTO_SCALE_LOW_THRESHOLD`: Usage thresholds for auto-scaling.
 
-## License
+## Reporting Issues
 
-This project is for educational purposes only.
+If you encounter any issues or bugs, please raise an issue.
