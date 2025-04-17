@@ -27,33 +27,6 @@ KubeSim simulates a Kubernetes-like cluster environment for educational purposes
 - Python 3.9+
 - Node.js/npm
 
-### Setup
-
-1.  **Set up Python environment** (optional but recommended):
-    ```bash
-    python -m venv venv
-    source venv/bin/activate # On Windows use `venv\Scripts\activate`
-    ```
-
-2.  **Install Python dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-3.  **Install frontend dependencies**:
-    ```bash
-    cd kubesim
-    npm install
-    cd ..
-    ```
-
-### Building the Node Image
-
-Build the Docker image required for the cluster nodes:
-
-```bash
-./start.sh build
-```
 
 ### Running the Application
 
