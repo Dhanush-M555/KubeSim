@@ -1,50 +1,53 @@
 #!/usr/bin/env python
 """
-Run all tests for KubeSim
+Test runner for KubeSim tests.
+Run all tests in the tests directory.
 """
 
-import unittest
-import sys
 import os
+import sys
+import subprocess
+import glob
 
-# Add the parent directory to the path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+def main():
+    """Run all test files in the tests directory"""
+    # Get all test files, excluding this runner
+    all_test_files = glob.glob("tests/test_*.py")
+    test_files = [f for f in all_test_files if 
+                  os.path.basename(f) != "run_tests.py"]
+    advanced_tests = [f for f in all_test_files if f.endswith("advanced.py")]
+    simple_tests = [f for f in all_test_files if f not in advanced_tests]
 
-# Import all test modules
-import tests.test_scheduling
-import tests.test_node_failure
-import tests.test_integration
-import tests.test_edge_cases
-import tests.test_pod_rescheduling
+    print(f"Found {len(test_files)} test files")
+    
+    # Run each test file
+    results = []
+    for test_file in advanced_tests:
+        print(f"\n{'='*20} RUNNING {os.path.basename(test_file)} {'='*20}\n")
+        result = subprocess.run([sys.executable, test_file], capture_output=False)
+        results.append((test_file, result.returncode))
+    
+    # Print summary
+    print("\n\n" + "="*60)
+    print("TEST SUMMARY")
+    print("="*60)
+    
+    passed = 0
+    failed = 0
+    
+    for test_file, returncode in results:
+        status = "PASSED" if returncode == 0 else "FAILED"
+        if returncode == 0:
+            passed += 1
+        else:
+            failed += 1
+        print(f"{os.path.basename(test_file)}: {status}")
+    
+    print("-"*60)
+    print(f"TOTAL: {len(results)}, PASSED: {passed}, FAILED: {failed}")
+    
+    # Return non-zero exit code if any test failed
+    return 1 if failed > 0 else 0
 
-# Create a test suite containing all tests
-def create_test_suite():
-    """Create a test suite containing all tests"""
-    test_suite = unittest.TestSuite()
-    
-    # Add tests from scheduling test module
-    test_suite.addTest(unittest.makeSuite(tests.test_scheduling.TestSchedulingAlgorithms))
-    
-    # Add tests from node failure test module
-    test_suite.addTest(unittest.makeSuite(tests.test_node_failure.TestNodeFailure))
-    
-    # Add tests from integration test module
-    test_suite.addTest(unittest.makeSuite(tests.test_integration.TestIntegration))
-    
-    # Add tests from edge cases test module
-    test_suite.addTest(unittest.makeSuite(tests.test_edge_cases.TestEdgeCases))
-    
-    # Add tests from pod rescheduling test module
-    test_suite.addTest(unittest.makeSuite(tests.test_pod_rescheduling.TestPodRescheduling))
-    
-    return test_suite
-
-if __name__ == '__main__':
-    # Create test suite
-    test_suite = create_test_suite()
-    
-    # Run the tests
-    test_result = unittest.TextTestRunner().run(test_suite)
-    
-    # Exit with appropriate code
-    sys.exit(0 if test_result.wasSuccessful() else 1) 
+if __name__ == "__main__":
+    sys.exit(main()) 

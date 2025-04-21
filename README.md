@@ -30,6 +30,8 @@ KubeSim simulates a Kubernetes-like cluster environment for educational purposes
 
 ### Running the Application
 
+Run these in separate terminals
+
 1.  **Start the Backend**:
     This script will start the main Flask API server and ensure the necessary Docker network is created.
     ```bash

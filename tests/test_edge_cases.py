@@ -18,7 +18,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Mock the config file loading
 config_data = """{
-    "AUTO_SCALE": true,
+    "AUTO_SCALE": false,
     "SCHEDULING_ALGO": "first-fit",
     "DEFAULT_NODE_CAPACITY": 4,
     "AUTO_SCALE_HIGH_THRESHOLD": 80,
@@ -75,7 +75,7 @@ class TestEdgeCases(unittest.TestCase):
     def setUpClass(cls):
         """Set up test environment once before all tests."""
         cls.test_config = {
-            "AUTO_SCALE": True,
+            "AUTO_SCALE": False,
             "SCHEDULING_ALGO": "first-fit",
             "DEFAULT_NODE_CAPACITY": 4,
             "AUTO_SCALE_HIGH_THRESHOLD": 80,

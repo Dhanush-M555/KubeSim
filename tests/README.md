@@ -2,45 +2,31 @@
 
 This directory contains tests for the KubeSim application.
 
-## Test Types
+## Test Structure
 
-There are two types of tests:
+The test suite is organized into several types of tests:
 
-1. **Mocked Tests**: Use unittest and mocks to simulate the application behavior.
-2. **Real Application Tests**: Launch the actual application and test its behavior.
+1. **Basic Tests**: Simple tests that cover core functionality for each algorithm
+   - `test_first_fit.py`: Tests the first-fit scheduling algorithm
+   - `test_best_fit.py`: Tests the best-fit scheduling algorithm  
+   - `test_worst_fit.py`: Tests the worst-fit scheduling algorithm
+   - `test_pod_rescheduling.py`: Tests basic pod rescheduling capabilities
+   - `test_pod_no_capacity.py`: Tests behavior when no nodes have capacity
 
-## Running Mocked Tests
+2. **Advanced Tests**: More comprehensive tests that cover edge cases and complex scenarios
+   - `test_first_fit_advanced.py`: Advanced tests for first-fit algorithm
+   - `test_best_fit_advanced.py`: Advanced tests for best-fit algorithm
+   - `test_worst_fit_advanced.py`: Advanced tests for worst-fit algorithm
+   
+3. **Integration Tests**:
+   - `test_integration.py`: Tests that verify multiple components working together
+   - `test_edge_cases.py`: Tests for handling unusual scenarios
+   - `test_node_failure.py`: Tests for handling node failures
+   - `test_scheduling.py`: General scheduling algorithm tests
 
-To run the mocked tests:
+## How Tests Work
 
-```bash
-python -m tests.run_tests
-```
-
-These tests use unittest and mocks to test the application logic without actually running the application or Docker containers.
-
-## Running Real Application Tests
-
-To run the real application tests:
-
-```bash
-python -m tests.run_real_tests
-```
-
-These tests actually launch the application and Docker containers to test the real system behavior. They clean up after themselves, but require:
-
-1. Docker to be installed and running
-2. The node image to be available (run `./start.sh build` first)
-3. Sufficient system resources to run multiple containers
-
-### Real Tests Include:
-
-- **Pod Rescheduling**: Tests that pods get properly rescheduled when a node is deleted
-- **Pod No Capacity**: Tests that the system correctly reports when pods cannot be rescheduled due to lack of capacity
-
-## How Real Tests Work
-
-The real tests:
+All tests:
 
 1. Modify the config.json file for the test scenario
 2. Launch the actual application
@@ -50,13 +36,6 @@ The real tests:
 6. Clean up all containers and resources
 
 Each test is self-contained and runs the application separately, ensuring a clean environment for each test.
-
-## Test Structure
-
-- `test_scheduling.py`: Tests the scheduling algorithms (first-fit, best-fit, worst-fit)
-- `test_node_failure.py`: Tests the handling of node failures and pod rescheduling
-- `test_integration.py`: Integration tests that verify all components working together
-- `run_tests.py`: Test runner script to execute all tests
 
 ## Running the Tests
 
@@ -73,17 +52,17 @@ python -m tests.run_tests
 To run a specific test file:
 
 ```bash
-python -m unittest tests.test_scheduling
-python -m unittest tests.test_node_failure
-python -m unittest tests.test_integration
+python tests/test_worst_fit.py
+python tests/test_pod_rescheduling.py
 ```
 
 ## Test Requirements
 
-The tests use Python's `unittest` framework and mock the necessary components to avoid requiring an actual Docker environment. The following packages are required:
+The following is required to run the tests:
 
-- unittest (built-in)
-- mock (part of unittest from Python 3.3+)
+1. Docker to be installed and running
+2. The node image to be available (run `./start.sh build` first)
+3. Sufficient system resources to run multiple containers
 
 ## Test Coverage
 
@@ -99,10 +78,11 @@ The tests cover:
    - Pod rescheduling when a node fails
    - Handling of pod deletion when a node is unreachable
 
-3. **Integration**
-   - Complete workflows for all scheduling algorithms
-   - Node failure recovery and auto-scaling
+3. **Advanced Scenarios**
+   - Complex pod rescheduling with limited capacity
+   - Tie-breaking in scheduling algorithms
+   - Multiple pods competing for limited resources
 
 ## Maximum Node Limit
 
-As requested, the tests are designed to never create more than 5 nodes to accommodate resource limitations on local systems. 
+The tests are designed to never create more than 5 nodes to accommodate resource limitations on local systems. 

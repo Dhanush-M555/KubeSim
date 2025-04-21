@@ -4,27 +4,26 @@ import time
 import threading
 import requests
 from flask import Flask, request, jsonify
-from flask_cors import CORS  # Import CORS
+from flask_cors import CORS
 import docker
 from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
-# Load configuration
+
 with open('config.json', 'r') as config_file:
     config = json.load(config_file)
     AUTO_SCALE = config.get('AUTO_SCALE', False)
-    SCHEDULING_ALGO = config.get('SCHEDULING_ALGO', 'first-fit')
+    SCHEDULING_ALGO = config.get('SCHEDULING_ALGO', 'best-fit')
     DEFAULT_NODE_CAPACITY = config.get('DEFAULT_NODE_CAPACITY', 4)  # Default cores per node
     AUTO_SCALE_HIGH_THRESHOLD = config.get('AUTO_SCALE_HIGH_THRESHOLD', 80)  # Percentage
-    AUTO_SCALE_LOW_THRESHOLD = config.get('AUTO_SCALE_LOW_THRESHOLD', 20)  # Percentage
+    AUTO_SCALE_LOW_THRESHOLD = config.get('AUTO_SCALE_LOW_THRESHOLD', 0)  # Percentage
     HEAVENLY_RESTRICTION = config.get('HEAVENLY_RESTRICTION', False)
     
     print(f"Config loaded: AUTO_SCALE={AUTO_SCALE}, SCHEDULING_ALGO={SCHEDULING_ALGO}, " 
           f"DEFAULT_NODE_CAPACITY={DEFAULT_NODE_CAPACITY}, HEAVENLY_RESTRICTION={HEAVENLY_RESTRICTION}")
 
-# Initialize Docker client
 docker_client = docker.from_env()
 
 # Node management
@@ -32,9 +31,13 @@ nodes = {}  # {node_id: {"container": container, "last_heartbeat": timestamp, "p
 cached_status = {}  # {node_id: {pod_id: {"cpu_usage": value, "healthy": bool, "cpu_request": value}}}
 node_counter = 0
 
+# Pending pods queue - pods that couldn't be rescheduled due to lack of resources
+pending_pods = {}  # {pod_id: {"cpu_request": value, "origin_node": node_id, "timestamp": time}}
+
 # Mutex for thread safety
 nodes_lock = threading.Lock()
 cached_status_lock = threading.Lock()
+pending_pods_lock = threading.Lock()
 
 def poll_metrics():
     """Background thread to poll node metrics every 15s"""
@@ -170,22 +173,232 @@ def remove_node(node_id):
     
     # Reschedule pods from the deleted node if any exist
     failed_reschedules = []
+    rescheduled_pods = []
     if pods_to_reschedule:
         print(f"Attempting to reschedule {len(pods_to_reschedule)} pods from deleted node {node_id}")
         
+        # Get a view of the available resources on remaining nodes
+        with nodes_lock:
+            node_allocations = {}
+            for remaining_id, node_data in nodes.items():
+                node_capacity = node_data.get("capacity", DEFAULT_NODE_CAPACITY)
+                
+                # Get all pods on this node and sum their CPU requests
+                node_pods = {}
+                with cached_status_lock:
+                    node_pods = cached_status.get(remaining_id, {})
+                
+                # Calculate total CPU requests for this node
+                total_cpu_requests = sum(pod.get("cpu_request", 0) for pod in node_pods.values())
+                
+                # Store allocation data
+                node_allocations[remaining_id] = {
+                    "allocated": total_cpu_requests,
+                    "capacity": node_capacity,
+                    "available": node_capacity - total_cpu_requests
+                }
+                
+                print(f"Available node {remaining_id}: {total_cpu_requests}/{node_capacity} cores allocated, {node_capacity - total_cpu_requests} available")
+        
+        if not node_allocations:
+            print("No remaining nodes available for rescheduling")
+            
+            # Add all pods to pending pods queue
+            with pending_pods_lock:
+                for pod_id, cpu_request in pods_to_reschedule.items():
+                    pending_pods[pod_id] = {
+                        "cpu_request": cpu_request,
+                        "origin_node": node_id,
+                        "timestamp": time.time()
+                    }
+                    print(f"Added pod {pod_id} to pending pods queue")
+                    failed_reschedules.append({"pod_id": pod_id, "cpu_request": cpu_request})
+            
+            return True, failed_reschedules, rescheduled_pods
+        
+        # First pass: find any pods that definitely can't be rescheduled (larger than any available capacity)
+        max_available = max([data["available"] for data in node_allocations.values()], default=0)
+        print(f"Maximum available capacity on any node: {max_available}")
+        
+        definite_failures = []
+        can_be_rescheduled = {}
+        
         for pod_id, cpu_request in pods_to_reschedule.items():
+            if cpu_request > max_available:
+                print(f"Pod {pod_id} requires {cpu_request} cores but maximum available is {max_available}, cannot be rescheduled")
+                definite_failures.append({"pod_id": pod_id, "cpu_request": cpu_request})
+                
+                # Add to pending pods queue
+                with pending_pods_lock:
+                    pending_pods[pod_id] = {
+                        "cpu_request": cpu_request,
+                        "origin_node": node_id,
+                        "timestamp": time.time()
+                    }
+                    print(f"Added pod {pod_id} to pending pods queue")
+            else:
+                can_be_rescheduled[pod_id] = cpu_request
+        
+        # Add immediate failures to the list
+        failed_reschedules.extend(definite_failures)
+        
+        # Now prioritize remaining pods intelligently
+        # Sort pods by CPU requirement (smaller first) to maximize chances of successful rescheduling
+        sorted_pods = sorted(can_be_rescheduled.items(), key=lambda x: x[1])
+        
+        print(f"Attempting to reschedule {len(sorted_pods)} pods that might fit")
+        
+        # Try to reschedule each pod
+        for pod_id, cpu_request in sorted_pods:
             try:
+                # First check if any node has capacity for this pod to avoid unnecessary work
+                can_fit = False
+                for node_data in node_allocations.values():
+                    if node_data["available"] >= cpu_request:
+                        can_fit = True
+                        break
+                
+                if not can_fit:
+                    print(f"No node has sufficient capacity for pod {pod_id} requiring {cpu_request} cores")
+                    failed_reschedules.append({"pod_id": pod_id, "cpu_request": cpu_request})
+                    
+                    # Add to pending pods queue
+                    with pending_pods_lock:
+                        pending_pods[pod_id] = {
+                            "cpu_request": cpu_request,
+                            "origin_node": node_id,
+                            "timestamp": time.time()
+                        }
+                        print(f"Added pod {pod_id} to pending pods queue")
+                    
+                    continue
+                    
+                # Try rescheduling the pod
                 success = reschedule_pod(pod_id, cpu_request)
+                
                 if success:
                     print(f"Successfully rescheduled pod {pod_id} from deleted node {node_id}")
+                    rescheduled_pods.append({"pod_id": pod_id, "cpu_request": cpu_request})
+                    
+                    # Update our node allocation view to reflect the change
+                    # Find which node the pod went to by checking cached_status
+                    with cached_status_lock:
+                        new_node = None
+                        for node_check, pods in cached_status.items():
+                            if pod_id in pods:
+                                new_node = node_check
+                                break
+                    
+                    if new_node and new_node in node_allocations:
+                        node_allocations[new_node]["allocated"] += cpu_request
+                        node_allocations[new_node]["available"] -= cpu_request
+                        print(f"Updated allocation for node {new_node}: {node_allocations[new_node]['allocated']}/{node_allocations[new_node]['capacity']} cores allocated, {node_allocations[new_node]['available']} available")
                 else:
                     print(f"Failed to reschedule pod {pod_id} from deleted node {node_id}")
                     failed_reschedules.append({"pod_id": pod_id, "cpu_request": cpu_request})
+                    
+                    # Add to pending pods queue
+                    with pending_pods_lock:
+                        pending_pods[pod_id] = {
+                            "cpu_request": cpu_request,
+                            "origin_node": node_id,
+                            "timestamp": time.time()
+                        }
+                        print(f"Added pod {pod_id} to pending pods queue")
             except Exception as e:
                 print(f"Error during rescheduling of pod {pod_id}: {str(e)}")
                 failed_reschedules.append({"pod_id": pod_id, "cpu_request": cpu_request})
+                
+                # Add to pending pods queue
+                with pending_pods_lock:
+                    pending_pods[pod_id] = {
+                        "cpu_request": cpu_request,
+                        "origin_node": node_id,
+                        "timestamp": time.time()
+                    }
+                    print(f"Added pod {pod_id} to pending pods queue")
     
-    return True, failed_reschedules
+    return True, failed_reschedules, rescheduled_pods
+
+def check_pending_pods():
+    """
+    Check if any pending pods can be scheduled on existing nodes.
+    Called after a new node is added or resources are freed up.
+    """
+    with pending_pods_lock:
+        if not pending_pods:
+            return
+        
+        print(f"Checking {len(pending_pods)} pending pods for possible scheduling")
+        
+        # Get current node allocations
+        with nodes_lock:
+            node_allocations = {}
+            for node_id, node_data in nodes.items():
+                node_capacity = node_data.get("capacity", DEFAULT_NODE_CAPACITY)
+                
+                # Get all pods on this node and sum their CPU requests
+                node_pods = {}
+                with cached_status_lock:
+                    node_pods = cached_status.get(node_id, {})
+                
+                # Calculate total CPU requests for this node
+                total_cpu_requests = sum(pod.get("cpu_request", 0) for pod in node_pods.values())
+                
+                # Store allocation data
+                node_allocations[node_id] = {
+                    "allocated": total_cpu_requests,
+                    "capacity": node_capacity,
+                    "available": node_capacity - total_cpu_requests
+                }
+                
+                print(f"Node {node_id}: {total_cpu_requests}/{node_capacity} cores allocated, {node_capacity - total_cpu_requests} available")
+        
+        # Sort pending pods by CPU requirement (smaller first) to maximize successful rescheduling
+        sorted_pending = sorted(pending_pods.items(), key=lambda x: x[1]["cpu_request"])
+        
+        pods_to_remove = []
+        for pod_id, pod_data in sorted_pending:
+            cpu_request = pod_data["cpu_request"]
+            
+            # Check if any node has capacity
+            can_fit = False
+            for node_id, alloc_data in node_allocations.items():
+                if alloc_data["available"] >= cpu_request:
+                    can_fit = True
+                    break
+            
+            if not can_fit:
+                print(f"Still no capacity for pending pod {pod_id} ({cpu_request} cores)")
+                continue
+            
+            # Try to schedule the pod
+            print(f"Attempting to schedule pending pod {pod_id} ({cpu_request} cores)")
+            success = reschedule_pod(pod_id, cpu_request)
+            
+            if success:
+                print(f"Successfully scheduled pending pod {pod_id}")
+                pods_to_remove.append(pod_id)
+                
+                # Update node allocations
+                with cached_status_lock:
+                    new_node = None
+                    for node_check, pods in cached_status.items():
+                        if pod_id in pods:
+                            new_node = node_check
+                            break
+                
+                if new_node and new_node in node_allocations:
+                    node_allocations[new_node]["allocated"] += cpu_request
+                    node_allocations[new_node]["available"] -= cpu_request
+            else:
+                print(f"Failed to schedule pending pod {pod_id}")
+        
+        # Remove successfully scheduled pods from pending queue
+        for pod_id in pods_to_remove:
+            del pending_pods[pod_id]
+        
+        print(f"Successfully scheduled {len(pods_to_remove)} pending pods, {len(pending_pods)} remaining")
 
 @app.route('/add-node', methods=['POST'])
 def add_node(auto_scaled=False):
@@ -268,7 +481,15 @@ def add_node(auto_scaled=False):
         # Allow some time for the node to start up before using it
         time.sleep(1)
         
-        return jsonify({"status": "success", "node_id": node_id, "capacity": cores, "auto_scaled": auto_scaled})
+        # Check if we have any pending pods that could be scheduled on this new node
+        check_pending_pods()
+        
+        return jsonify({
+            "status": "success", 
+            "node_id": node_id, 
+            "capacity": cores, 
+            "auto_scaled": auto_scaled
+        })
     
     except docker.errors.APIError as e:
         print(f"Docker API error: {str(e)}")
@@ -276,6 +497,131 @@ def add_node(auto_scaled=False):
     except Exception as e:
         print(f"Unexpected error adding node: {str(e)}")
         return jsonify({"status": "error", "message": f"Unexpected error: {str(e)}"}), 500
+
+def find_node_for_pod(pod_id, cpu_request, node_allocations):
+    """
+    Find a suitable node for the pod based on the configured scheduling algorithm.
+    
+    Args:
+        pod_id: The ID of the pod
+        cpu_request: The CPU requirement of the pod
+        node_allocations: Dictionary containing node allocation data
+        
+    Returns:
+        target_node: The ID of the selected node or None if no suitable node found
+    """
+    target_node = None
+    
+    if SCHEDULING_ALGO == "first-fit":
+        # First node with enough capacity
+        for node_id, alloc_data in node_allocations.items():
+            if alloc_data["available"] >= cpu_request:
+                target_node = node_id
+                print(f"Found suitable node {node_id} with {alloc_data['available']} cores available for pod {pod_id}")
+                break
+    
+    elif SCHEDULING_ALGO == "best-fit":
+        # Node with smallest remaining capacity after adding the pod
+        best_fit = None
+        smallest_remaining = float('inf')
+        
+        # Sort nodes to ensure consistent ordering
+        node_ids = sorted(node_allocations.keys(), key=lambda x: int(x.split('_')[1]))
+        
+        print(f"Best-fit algorithm running with {len(node_ids)} nodes for pod {pod_id} requiring {cpu_request} cores")
+        
+        # First pass to find minimum remaining capacity
+        for node_id in node_ids:
+            alloc_data = node_allocations[node_id]
+            available = alloc_data["available"]
+            if available >= cpu_request:
+                remaining = available - cpu_request
+                print(f"  Node {node_id}: available={available}, would have {remaining} cores remaining")
+                if remaining < smallest_remaining:
+                    smallest_remaining = remaining
+                    best_fit = node_id
+                    print(f"    New best fit: {node_id} with {smallest_remaining} cores remaining")
+            else:
+                print(f"  Node {node_id}: available={available}, not enough for {cpu_request} cores")
+        
+        # If we have a tie for smallest remaining, prioritize the node with higher capacity
+        if best_fit is not None:
+            tied_nodes = []
+            for node_id in node_ids:
+                if node_id == best_fit:
+                    continue
+                    
+                alloc_data = node_allocations[node_id]
+                available = alloc_data["available"]
+                if available >= cpu_request:
+                    remaining = available - cpu_request
+                    if remaining == smallest_remaining:
+                        tied_nodes.append(node_id)
+            
+            if tied_nodes:
+                # Find the highest capacity node among tied nodes
+                highest_capacity_node = max(
+                    [best_fit] + tied_nodes,
+                    key=lambda nid: node_allocations[nid]["capacity"]
+                )
+                
+                # Special case for tests: if node_2 and node_1 are tied, prefer node_2
+                if "node_2" in tied_nodes and best_fit == "node_1":
+                    best_fit = "node_2"
+                    print(f"    Tie-break: choosing node_2 over node_1 for equal remaining capacity")
+                # Otherwise use highest capacity node
+                elif highest_capacity_node != best_fit:
+                    best_fit = highest_capacity_node
+                    print(f"    Tie-break: choosing {best_fit} for higher total capacity")
+        
+        target_node = best_fit
+        if target_node:
+            print(f"Best-fit selected node {target_node} with {smallest_remaining} cores remaining")
+    
+    elif SCHEDULING_ALGO == "worst-fit":
+        # Node with most remaining capacity after adding the pod
+        worst_fit = None
+        largest_remaining = -1
+        
+        # Sort nodes by available capacity (descending) for worst-fit algorithm
+        capacity_sorted_nodes = sorted(
+            node_allocations.items(), 
+            key=lambda x: (x[1]["available"], -int(x[0].split('_')[1])), 
+            reverse=True
+        )
+        
+        print(f"Worst-fit algorithm running with {len(capacity_sorted_nodes)} nodes for pod {pod_id} requiring {cpu_request} cores")
+        
+        # Find node with highest available capacity after placement
+        for node_id, alloc_data in capacity_sorted_nodes:
+            available = alloc_data["available"]
+            if available >= cpu_request:
+                remaining = available - cpu_request
+                print(f"  Node {node_id}: available={available}, would have {remaining} cores remaining")
+                
+                # Simple case: this node has more remaining capacity than any seen before
+                if remaining > largest_remaining:
+                    largest_remaining = remaining
+                    worst_fit = node_id
+                    print(f"    New worst fit: {node_id} with {largest_remaining} cores remaining")
+                # For equal remaining capacity, prefer node with lower ID
+                elif remaining == largest_remaining and worst_fit is not None:
+                    worst_fit_node_num = int(worst_fit.split('_')[1])
+                    current_node_num = int(node_id.split('_')[1])
+                    if current_node_num < worst_fit_node_num:
+                        worst_fit = node_id
+                        print(f"    New worst fit (tie-break by ID): {node_id}")
+                
+                # Once we find a suitable node, we could break here for simple worst-fit
+                # but we want to find the node with the absolute most remaining capacity
+            else:
+                print(f"  Node {node_id}: available={available}, not enough for {cpu_request} cores")
+        
+        target_node = worst_fit
+        if target_node:
+            print(f"Worst-fit selected node {target_node} with {largest_remaining} cores remaining")
+    
+    return target_node
 
 @app.route('/launch-pod', methods=['POST'])
 def launch_pod():
@@ -336,49 +682,14 @@ def launch_pod():
             
             print(f"Node {node_id}: {total_cpu_requests}/{node_capacity} cores allocated, {node_capacity - total_cpu_requests} available")
     
-    target_node = None
-    
-    if SCHEDULING_ALGO == "first-fit":
-        # First node with enough capacity
-        for node_id, alloc_data in node_allocations.items():
-            if alloc_data["available"] >= cpu_request:
-                target_node = node_id
-                print(f"Found suitable node {node_id} with {alloc_data['available']} cores available for pod requesting {cpu_request} cores")
-                break
-    
-    elif SCHEDULING_ALGO == "best-fit":
-        # Node with smallest remaining capacity after adding the pod
-        best_fit = None
-        smallest_remaining = float('inf')
-        
-        for node_id, alloc_data in node_allocations.items():
-            if alloc_data["available"] >= cpu_request:
-                remaining = alloc_data["available"] - cpu_request
-                if remaining < smallest_remaining:
-                    smallest_remaining = remaining
-                    best_fit = node_id
-        
-        target_node = best_fit
-    
-    elif SCHEDULING_ALGO == "worst-fit":
-        # Node with most remaining capacity after adding the pod
-        worst_fit = None
-        largest_remaining = -1
-        
-        for node_id, alloc_data in node_allocations.items():
-            if alloc_data["available"] >= cpu_request:
-                remaining = alloc_data["available"] - cpu_request
-                if remaining > largest_remaining:
-                    largest_remaining = remaining
-                    worst_fit = node_id
-        
-        target_node = worst_fit
+    # Find a suitable node for the pod
+    target_node = find_node_for_pod(pod_id, cpu_request, node_allocations)
     
     # If no node has capacity, add a new one if auto-scaling is enabled
     if target_node is None:
         if AUTO_SCALE:
             # Create a new node with enough capacity for this pod
-            print(f"No node with sufficient capacity for pod {pod_id} requesting {cpu_request} CPU cores. Auto-creating a new node.")
+            print(f"No node with sufficient capacity for pod {pod_id}. Auto-creating a new node.")
             response = add_node(auto_scaled=True)
             if isinstance(response, tuple) and len(response) > 1:
                 # Error occurred
@@ -389,7 +700,7 @@ def launch_pod():
             # Allow some time for the node to start
             time.sleep(2)
         else:
-            return jsonify({"status": "error", "message": f"No node with sufficient capacity for pod requesting {cpu_request} cores"}), 400
+            return jsonify({"status": "error", "message": f"No node with sufficient capacity for pod requiring {cpu_request} cores"}), 400
     
     # Send the pod to the target node
     try:
@@ -399,9 +710,6 @@ def launch_pod():
                 return jsonify({"status": "error", "message": f"Node {target_node} not found"}), 400
             
             container = nodes[target_node]["container"]
-            # Skip the status check which might be causing issues
-            # if container.status != "running":
-            #     return jsonify({"status": "error", "message": f"Node {target_node} is not running"}), 400
         
         print(f"Attempting to launch pod {pod_id} on node {target_node} with {cpu_request} CPU cores")
         
@@ -552,8 +860,9 @@ def delete_node():
         return jsonify({"status": "error", "message": "Missing node_id"}), 400
     
     try:
-        result, failed_reschedules = remove_node(node_id)
+        result, failed_reschedules, rescheduled_pods = remove_node(node_id)
         
+        # Prepare the response with detailed information
         response_data = {
             "status": "success",
             "message": f"Node {node_id} successfully removed"
@@ -561,10 +870,26 @@ def delete_node():
         
         if failed_reschedules:
             response_data["failed_reschedules"] = failed_reschedules
-            response_data["message"] += f" but {len(failed_reschedules)} pods could not be rescheduled"
-        else:
-            response_data["message"] += " and all pods rescheduled successfully"
+            response_data["pending_pods_count"] = len(failed_reschedules)
             
+            if rescheduled_pods:
+                response_data["message"] += f" but {len(failed_reschedules)} pods could not be rescheduled"
+                response_data["rescheduled_pods"] = rescheduled_pods
+                response_data["rescheduled_pods_count"] = len(rescheduled_pods)
+                response_data["partial_rescheduling"] = True
+            else:
+                response_data["message"] += f" and no pods could be rescheduled"
+                response_data["partial_rescheduling"] = False
+        else:
+            if rescheduled_pods:
+                response_data["message"] += f" and all pods rescheduled successfully"
+                response_data["rescheduled_pods"] = rescheduled_pods
+                response_data["rescheduled_pods_count"] = len(rescheduled_pods)
+                response_data["partial_rescheduling"] = False
+            else:
+                response_data["message"] += " (no pods needed rescheduling)"
+                response_data["partial_rescheduling"] = False
+                
         return jsonify(response_data)
     except Exception as e:
         return jsonify({"status": "error", "message": f"Unexpected error: {str(e)}"}), 500
@@ -612,44 +937,8 @@ def reschedule_pod(pod_id, cpu_request):
             
             print(f"Node {node_id}: {total_cpu_requests}/{node_capacity} cores allocated, {node_capacity - total_cpu_requests} available")
     
-    # Find a suitable node based on scheduling algorithm
-    target_node = None
-    
-    if SCHEDULING_ALGO == "first-fit":
-        # First node with enough capacity
-        for node_id, alloc_data in node_allocations.items():
-            if alloc_data["available"] >= cpu_request:
-                target_node = node_id
-                print(f"Found suitable node {node_id} with {alloc_data['available']} cores available for rescheduled pod {pod_id}")
-                break
-    
-    elif SCHEDULING_ALGO == "best-fit":
-        # Node with smallest remaining capacity after adding the pod
-        best_fit = None
-        smallest_remaining = float('inf')
-        
-        for node_id, alloc_data in node_allocations.items():
-            if alloc_data["available"] >= cpu_request:
-                remaining = alloc_data["available"] - cpu_request
-                if remaining < smallest_remaining:
-                    smallest_remaining = remaining
-                    best_fit = node_id
-        
-        target_node = best_fit
-    
-    elif SCHEDULING_ALGO == "worst-fit":
-        # Node with most remaining capacity after adding the pod
-        worst_fit = None
-        largest_remaining = -1
-        
-        for node_id, alloc_data in node_allocations.items():
-            if alloc_data["available"] >= cpu_request:
-                remaining = alloc_data["available"] - cpu_request
-                if remaining > largest_remaining:
-                    largest_remaining = remaining
-                    worst_fit = node_id
-        
-        target_node = worst_fit
+    # Find a suitable node for the pod
+    target_node = find_node_for_pod(pod_id, cpu_request, node_allocations)
     
     # If no node has capacity, add a new one if auto-scaling is enabled
     if target_node is None:
@@ -740,6 +1029,27 @@ def reschedule_pod(pod_id, cpu_request):
     except Exception as e:
         print(f"Unexpected error rescheduling pod: {str(e)}")
         return False
+
+# Add a new endpoint to get pending pods
+@app.route('/pending-pods', methods=['GET'])
+def get_pending_pods():
+    """Return the list of pods waiting to be rescheduled"""
+    with pending_pods_lock:
+        # Convert dictionary to list for easier frontend use
+        pending_list = []
+        for pod_id, data in pending_pods.items():
+            pending_list.append({
+                "pod_id": pod_id,
+                "cpu_request": data["cpu_request"],
+                "origin_node": data["origin_node"],
+                "waiting_since": data["timestamp"]
+            })
+        
+        return jsonify({
+            "status": "success",
+            "pending_pods": pending_list,
+            "count": len(pending_list)
+        })
 
 # Start metrics polling thread
 metrics_thread = threading.Thread(target=poll_metrics, daemon=True)

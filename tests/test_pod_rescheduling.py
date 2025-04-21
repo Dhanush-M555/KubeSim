@@ -1,288 +1,446 @@
+#!/usr/bin/env python
 """
-Tests for pod rescheduling feature.
+Real application test for pod rescheduling after node deletion.
+This test launches the actual application and tests if pod rescheduling works properly.
 """
 
-import unittest
-import json
 import os
-import sys
 import time
+import json
+import sys
+import subprocess
 import requests
-from unittest.mock import patch, MagicMock
+import signal
+import docker
+import argparse
 
-# Add the parent directory to the path so we can import app
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-# Apply patches before importing app
-docker_patcher = patch('docker.from_env')
-docker_mock = docker_patcher.start()
-
-# Mock container and network
-mock_container = MagicMock()
-mock_container.id = 'mock_container_id'
-mock_container.status = 'running'
-
-mock_network = MagicMock()
-
-# Set up mock Docker client responses
-docker_mock.return_value.containers.run.return_value = mock_container
-docker_mock.return_value.networks.list.return_value = [mock_network]
-docker_mock.return_value.networks.get.return_value = mock_network
-docker_mock.return_value.api.inspect_container.return_value = {
-    'NetworkSettings': {'Networks': {'cluster-net': {'IPAddress': '172.17.0.2'}}}
-}
-
-# Patch requests before importing app
-requests_post_patcher = patch('requests.post')
-requests_post_mock = requests_post_patcher.start()
-requests_post_mock.return_value.status_code = 200
-
-requests_get_patcher = patch('requests.get')
-requests_get_mock = requests_get_patcher.start()
-requests_get_mock.return_value.status_code = 200
-requests_get_mock.return_value.json.return_value = {}
-
-requests_delete_patcher = patch('requests.delete')
-requests_delete_mock = requests_delete_patcher.start()
-requests_delete_mock.return_value.status_code = 200
-
-# Now import app with patched dependencies
-import app as app_module
-
-# Override the app docker client
-app_module.docker_client = docker_mock.return_value
-
-class TestPodRescheduling(unittest.TestCase):
-    """Test that pods get rescheduled when nodes are deleted."""
+def cleanup_containers():
+    """Clean up all Docker containers created during testing"""
+    print("Cleaning up containers...")
+    client = docker.from_env()
     
-    def setUp(self):
-        """Set up before each test."""
-        # Reset mocks
-        docker_mock.reset_mock()
-        requests_post_mock.reset_mock()
-        requests_get_mock.reset_mock()
-        requests_delete_mock.reset_mock()
-        
-        # Create a test client
-        self.app = app_module.app.test_client()
-        
-        # Enable auto-scaling for rescheduling
-        app_module.AUTO_SCALE = True
-        app_module.SCHEDULING_ALGO = 'first-fit'
-        
-        # Clear nodes and cached status
-        with app_module.nodes_lock:
-            app_module.nodes.clear()
-            
-        with app_module.cached_status_lock:
-            app_module.cached_status.clear()
-            
-    def test_pod_rescheduling_on_node_deletion(self):
-        """Test that pods get rescheduled when a node is deleted."""
-        # Create two nodes
-        mock_container_1 = MagicMock()
-        mock_container_1.id = 'mock_container_id_1'
-        mock_container_1.status = 'running'
-        
-        mock_container_2 = MagicMock()
-        mock_container_2.id = 'mock_container_id_2'
-        mock_container_2.status = 'running'
-        
-        # Create containers with inspection data
-        def mock_inspect_container(container_id):
-            if container_id == 'mock_container_id_1':
-                return {
-                    'NetworkSettings': {'Networks': {'cluster-net': {'IPAddress': '172.17.0.2'}}}
-                }
-            elif container_id == 'mock_container_id_2':
-                return {
-                    'NetworkSettings': {'Networks': {'cluster-net': {'IPAddress': '172.17.0.3'}}}
-                }
-            return {
-                'NetworkSettings': {'Networks': {'cluster-net': {'IPAddress': '172.17.0.2'}}}
-            }
-            
-        app_module.docker_client.api.inspect_container.side_effect = mock_inspect_container
-        
-        # Setup nodes
-        with app_module.nodes_lock:
-            app_module.nodes['node_1'] = {
-                "container": mock_container_1,
-                "last_heartbeat": time.time(),
-                "pod_health": {},
-                "capacity": 4
-            }
-            
-            app_module.nodes['node_2'] = {
-                "container": mock_container_2,
-                "last_heartbeat": time.time(),
-                "pod_health": {},
-                "capacity": 4
-            }
-            
-        # Setup cached status with a pod on node_1
-        with app_module.cached_status_lock:
-            app_module.cached_status['node_1'] = {
-                'pod_1': {'cpu_request': 2, 'cpu_usage': 1.5, 'healthy': True}
-            }
-            app_module.cached_status['node_2'] = {}
-            
-        # Create a mock for the post request to simulate successful pod launch
-        def mock_post(*args, **kwargs):
-            mock_response = MagicMock()
-            mock_response.status_code = 200
-            mock_response.text = "Success"
-            return mock_response
-            
-        # Create a simple tracker to check if rescheduling happened
-        rescheduling_happened = [False]
-        
-        # Override the reschedule_pod function to track calls
-        original_reschedule = app_module.reschedule_pod
-        def mock_reschedule_pod(pod_id, cpu_request):
-            rescheduling_happened[0] = True
-            print(f"Mock rescheduling pod {pod_id} with {cpu_request} CPU")
-            
-            # Update cached status as if successfully rescheduled to node_2
-            with app_module.cached_status_lock:
-                if 'node_2' not in app_module.cached_status:
-                    app_module.cached_status['node_2'] = {}
-                
-                app_module.cached_status['node_2'][pod_id] = {
-                    'cpu_request': cpu_request,
-                    'cpu_usage': 0,
-                    'healthy': True
-                }
-            
-            return True
-        
-        # Patch the reschedule_pod function and requests
-        with patch.object(app_module, 'reschedule_pod', mock_reschedule_pod):
-            with patch.object(requests, 'post', mock_post):
-                # Delete node_1
-                response = self.app.delete('/delete-node', json={'node_id': 'node_1'})
-                self.assertEqual(response.status_code, 200)
-                
-                # Verify rescheduling was attempted
-                self.assertTrue(rescheduling_happened[0])
-                
-                # Verify pod has been moved to node_2
-                with app_module.cached_status_lock:
-                    self.assertNotIn('node_1', app_module.cached_status)
-                    self.assertIn('node_2', app_module.cached_status)
-                    self.assertIn('pod_1', app_module.cached_status['node_2'])
-                    
-                    # Verify CPU request was preserved
-                    self.assertEqual(app_module.cached_status['node_2']['pod_1']['cpu_request'], 2)
+    try:
+        # Remove all containers in the cluster-net network
+        containers = client.containers.list(all=True)
+        for container in containers:
+            try:
+                if "node_" in container.name:
+                    print(f"Stopping and removing container: {container.name}")
+                    container.stop()
+                    container.remove()
+            except Exception as e:
+                print(f"Error removing container {container.name}: {e}")
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
     
-    def test_pod_rescheduling_with_autoscaling(self):
-        """Test rescheduling when there's not enough capacity on existing nodes."""
-        # Create a single node with pods that use up most of its capacity
-        mock_container_1 = MagicMock()
-        mock_container_1.id = 'mock_container_id_1'
-        mock_container_1.status = 'running'
+    # Try to remove the network
+    try:
+        networks = client.networks.list(names=["cluster-net"])
+        for network in networks:
+            try:
+                print(f"Removing network: {network.name}")
+                network.remove()
+            except Exception as e:
+                print(f"Error removing network {network.name}: {e}")
+    except Exception as e:
+        print(f"Error listing networks: {e}")
+
+def wait_for_api(base_url, max_attempts=20, delay=1):
+    """Wait for the API to become available"""
+    print(f"Waiting for API at {base_url}...")
+    for i in range(max_attempts):
+        try:
+            response = requests.get(f"{base_url}/list-nodes", timeout=2)
+            if response.status_code == 200:
+                print("API is ready!")
+                return True
+        except requests.exceptions.RequestException:
+            pass
         
-        # Setup the node with limited capacity
-        with app_module.nodes_lock:
-            app_module.nodes['node_1'] = {
-                "container": mock_container_1,
-                "last_heartbeat": time.time(),
-                "pod_health": {},
-                "capacity": 4
-            }
-            
-        # Setup cached status with a large pod that will need a new node
-        with app_module.cached_status_lock:
-            app_module.cached_status['node_1'] = {
-                'pod_1': {'cpu_request': 3, 'cpu_usage': 2.5, 'healthy': True}
-            }
+        time.sleep(delay)
         
-        # Track if autoscaling was triggered
-        autoscaling_triggered = [False]
+    print("API did not become available in time")
+    return False
+
+def test_pod_rescheduling():
+    """
+    Test that pods get properly rescheduled when a node is deleted.
+    This test:
+    1. Updates the config to enable auto-scaling
+    2. Starts the application
+    3. Creates multiple nodes
+    4. Launches pods on a specific node
+    5. Deletes that node
+    6. Verifies that the pods were rescheduled to another node
+    """
+    # Step 1: Update config for testing
+    config = {
+        "AUTO_SCALE": True,
+        "SCHEDULING_ALGO": "first-fit",
+        "DEFAULT_NODE_CAPACITY": 4,
+        "AUTO_SCALE_HIGH_THRESHOLD": 80,
+        "AUTO_SCALE_LOW_THRESHOLD": 20,
+        "HEAVENLY_RESTRICTION": False
+    }
+    
+    with open("config.json", "w") as f:
+        json.dump(config, f, indent=2)
+    
+    # Step 2: Start the application
+    api_url = "http://localhost:5000"
+    
+    # Clean up any existing containers
+    cleanup_containers()
+    
+    # Start the application as a subprocess
+    print("Starting KubeSim application...")
+    app_process = subprocess.Popen(["python", "app.py"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    try:
+        # Wait for API to be ready
+        if not wait_for_api(api_url, max_attempts=20):
+            print("API did not start properly, aborting test")
+            app_process.terminate()
+            return False
         
-        # Mock the add_node function
-        original_add_node = app_module.add_node
-        def mock_add_node(auto_scaled=False):
-            autoscaling_triggered[0] = True
-            print(f"Mock creating new node for rescheduling with auto_scaled={auto_scaled}")
-            
-            # Create a mock node response
-            mock_container_2 = MagicMock()
-            mock_container_2.id = 'mock_container_id_2'
-            mock_container_2.status = 'running'
-            
-            # Add the new node
-            with app_module.nodes_lock:
-                app_module.nodes['node_2'] = {
-                    "container": mock_container_2,
-                    "last_heartbeat": time.time(),
-                    "pod_health": {},
-                    "capacity": 8  # Higher capacity
-                }
-            
-            class MockResponse:
-                def __init__(self, json_data, status_code):
-                    self.json_data = json_data
-                    self.status_code = status_code
-                
-                def get_json(self):
-                    return self.json_data
-            
-            return MockResponse({"status": "success", "node_id": "node_2"}, 200)
+        # Step 3: Create nodes
+        print("Creating nodes...")
+        node1_response = requests.post(f"{api_url}/add-node", json={"cores": 4})
+        if node1_response.status_code != 200:
+            print(f"Failed to create first node: {node1_response.text}")
+            return False
         
-        # Create a mock for the post request to simulate successful pod launch
-        def mock_post(*args, **kwargs):
-            mock_response = MagicMock()
-            mock_response.status_code = 200
-            mock_response.text = "Success"
-            return mock_response
+        node1_data = node1_response.json()
+        node1_id = node1_data["node_id"]
+        print(f"Created node: {node1_id}")
         
-        # Override the reschedule_pod function to use original logic but update our tracking
-        def mock_reschedule_pod(pod_id, cpu_request):
-            print(f"Attempting to reschedule pod {pod_id} with {cpu_request} CPU")
-            
-            # Skip to the part where we would create a new node
-            result = mock_add_node(auto_scaled=True)
-            
-            # Update cached status as if successfully rescheduled
-            with app_module.cached_status_lock:
-                if 'node_2' not in app_module.cached_status:
-                    app_module.cached_status['node_2'] = {}
-                
-                app_module.cached_status['node_2'][pod_id] = {
-                    'cpu_request': cpu_request,
-                    'cpu_usage': 0,
-                    'healthy': True
-                }
-            
+        node2_response = requests.post(f"{api_url}/add-node", json={"cores": 4})
+        if node2_response.status_code != 200:
+            print(f"Failed to create second node: {node2_response.text}")
+            return False
+        
+        node2_data = node2_response.json()
+        node2_id = node2_data["node_id"]
+        print(f"Created node: {node2_id}")
+        
+        # Wait for nodes to initialize
+        time.sleep(5)
+        
+        # Step 4: Launch pods on the first node
+        print("Launching pods on the first node...")
+        pod1_response = requests.post(
+            f"{api_url}/launch-pod",
+            json={"pod_id": "test_pod_1", "cpu": 2}
+        )
+        if pod1_response.status_code != 200:
+            print(f"Failed to launch pod 1: {pod1_response.text}")
+            return False
+        
+        pod2_response = requests.post(
+            f"{api_url}/launch-pod",
+            json={"pod_id": "test_pod_2", "cpu": 1}
+        )
+        if pod2_response.status_code != 200:
+            print(f"Failed to launch pod 2: {pod2_response.text}")
+            return False
+        
+        # Wait for pods to start
+        time.sleep(5)
+        
+        # Get pod status to verify they're on the expected nodes
+        pods_status_response = requests.get(f"{api_url}/pod-status")
+        pods_status = pods_status_response.json()
+        print("Initial pod status:", json.dumps(pods_status, indent=2))
+        
+        # Find which node has the pods
+        pod1_node = None
+        pod2_node = None
+        for node_id, node_data in pods_status.items():
+            if "test_pod_1" in node_data:
+                pod1_node = node_id
+            if "test_pod_2" in node_data:
+                pod2_node = node_id
+        
+        # If both pods are on the same node, delete that node
+        target_node = None
+        if pod1_node == pod2_node:
+            target_node = pod1_node
+        else:
+            # If they're on different nodes, pick the first node
+            target_node = pod1_node
+        
+        print(f"Pods are on node(s): pod1={pod1_node}, pod2={pod2_node}")
+        print(f"Will delete node: {target_node}")
+        
+        # Step 5: Delete the node with the pods
+        print(f"Deleting node {target_node}...")
+        delete_response = requests.delete(
+            f"{api_url}/delete-node",
+            json={"node_id": target_node}
+        )
+        
+        if delete_response.status_code != 200:
+            print(f"Failed to delete node: {delete_response.text}")
+            return False
+        
+        delete_result = delete_response.json()
+        print("Delete node response:", json.dumps(delete_result, indent=2))
+        
+        # Wait for rescheduling to complete
+        time.sleep(10)
+        
+        # Step 6: Verify pods were rescheduled
+        print("Checking if pods were rescheduled...")
+        final_status_response = requests.get(f"{api_url}/pod-status")
+        final_status = final_status_response.json()
+        print("Final pod status:", json.dumps(final_status, indent=2))
+        
+        # Check if the pods exist on any node
+        found_pod1 = False
+        found_pod2 = False
+        
+        for node_id, node_data in final_status.items():
+            if "test_pod_1" in node_data:
+                found_pod1 = True
+                print(f"Found pod1 on node {node_id}")
+            if "test_pod_2" in node_data:
+                found_pod2 = True
+                print(f"Found pod2 on node {node_id}")
+        
+        # Make sure deleted node is gone
+        assert target_node not in final_status, f"Deleted node {target_node} should not be in final status"
+        
+        # Check if pods were successfully rescheduled
+        if "failed_reschedules" in delete_result:
+            for failed_pod in delete_result["failed_reschedules"]:
+                pod_id = failed_pod["pod_id"]
+                if pod_id == "test_pod_1":
+                    found_pod1 = False
+                elif pod_id == "test_pod_2":
+                    found_pod2 = False
+        
+        if found_pod1 and found_pod2:
+            print("SUCCESS: All pods were successfully rescheduled!")
             return True
+        else:
+            missing_pods = []
+            if not found_pod1:
+                missing_pods.append("test_pod_1")
+            if not found_pod2:
+                missing_pods.append("test_pod_2")
+            print(f"FAILURE: Some pods were not rescheduled: {', '.join(missing_pods)}")
+            return False
         
-        # Patch the necessary functions
-        with patch.object(app_module, 'add_node', mock_add_node):
-            with patch.object(app_module, 'reschedule_pod', mock_reschedule_pod):
-                with patch.object(requests, 'post', mock_post):
-                    # Delete node_1
-                    response = self.app.delete('/delete-node', json={'node_id': 'node_1'})
-                    self.assertEqual(response.status_code, 200)
-                    
-                    # Verify autoscaling was triggered
-                    self.assertTrue(autoscaling_triggered[0])
-                    
-                    # Verify pod has been moved to node_2
-                    with app_module.cached_status_lock:
-                        self.assertNotIn('node_1', app_module.cached_status)
-                        self.assertIn('node_2', app_module.cached_status)
-                        self.assertIn('pod_1', app_module.cached_status['node_2'])
-                        
-                        # Verify CPU request was preserved
-                        self.assertEqual(app_module.cached_status['node_2']['pod_1']['cpu_request'], 3)
+    except Exception as e:
+        print(f"Test failed with error: {e}")
+        return False
+    finally:
+        # Clean up
+        print("Stopping application...")
+        app_process.terminate()
+        app_process.wait(timeout=5)
+        cleanup_containers()
 
-# Clean up patches
-def tearDownModule():
-    docker_patcher.stop()
-    requests_post_patcher.stop()
-    requests_get_patcher.stop()
-    requests_delete_patcher.stop()
+def test_partial_rescheduling():
+    """
+    Test that when a node is deleted with multiple pods, smaller pods are rescheduled
+    while larger pods that can't fit are properly reported as failed.
+    
+    This test specifically tests the scenario where:
+    1. Node 1 has 8 cores
+    2. Node 2 has 5 cores
+    3. Two pods on Node 1: one 6-core pod and one 2-core pod
+    4. When Node 1 is deleted, the 6-core pod can't be rescheduled (too big)
+       but the 2-core pod should be rescheduled to Node 2
+    """
+    # Configure with best-fit algorithm
+    config = {
+        "AUTO_SCALE": False,
+        "SCHEDULING_ALGO": "best-fit",
+        "DEFAULT_NODE_CAPACITY": 4,
+        "AUTO_SCALE_HIGH_THRESHOLD": 80,
+        "AUTO_SCALE_LOW_THRESHOLD": 20,
+        "HEAVENLY_RESTRICTION": False
+    }
+    
+    with open("config.json", "w") as f:
+        json.dump(config, f, indent=2)
+    
+    api_url = "http://localhost:5000"
+    
+    # Clean up any existing containers
+    cleanup_containers()
+    
+    # Start the application
+    print("Starting KubeSim application...")
+    app_process = subprocess.Popen(["python", "app.py"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    try:
+        # Wait for API to be ready
+        if not wait_for_api(api_url, max_attempts=20):
+            print("API did not start properly, aborting test")
+            app_process.terminate()
+            return False
+        
+        # Create 2 nodes with specific capacities
+        print("Creating nodes...")
+        
+        # Node 1 with 8 cores
+        node1_response = requests.post(f"{api_url}/add-node", json={"cores": 8})
+        if node1_response.status_code != 200:
+            print(f"Failed to create node 1: {node1_response.text}")
+            return False
+        
+        node1_data = node1_response.json()
+        node1_id = node1_data["node_id"]
+        print(f"Created node 1: {node1_id} with 8 cores")
+        
+        # Node 2 with 5 cores
+        node2_response = requests.post(f"{api_url}/add-node", json={"cores": 5})
+        if node2_response.status_code != 200:
+            print(f"Failed to create node 2: {node2_response.text}")
+            return False
+        
+        node2_data = node2_response.json()
+        node2_id = node2_data["node_id"]
+        print(f"Created node 2: {node2_id} with 5 cores")
+        
+        # Wait for nodes to initialize
+        time.sleep(2)
+        
+        # Create 2 pods on node 1
+        print("Creating pods on node 1...")
+        
+        # 6-core pod
+        pod1_response = requests.post(f"{api_url}/launch-pod", json={"pod_id": "large_pod", "cpu": 6})
+        if pod1_response.status_code != 200:
+            print(f"Failed to create 6-core pod: {pod1_response.text}")
+            return False
+        
+        pod1_data = pod1_response.json()
+        pod1_node = pod1_data.get("node_id")
+        if pod1_node != node1_id:
+            print(f"Expected 6-core pod to go to node {node1_id}, but it went to {pod1_node}")
+            # Not a failure, just a warning
+        
+        # 2-core pod
+        pod2_response = requests.post(f"{api_url}/launch-pod", json={"pod_id": "small_pod", "cpu": 2})
+        if pod2_response.status_code != 200:
+            print(f"Failed to create 2-core pod: {pod2_response.text}")
+            return False
+        
+        pod2_data = pod2_response.json()
+        pod2_node = pod2_data.get("node_id")
+        if pod2_node != node1_id:
+            print(f"Expected 2-core pod to go to node {node1_id}, but it went to {pod2_node}")
+            # Not a failure, just a warning
+        
+        # Create a 2-core pod on node 2
+        pod3_response = requests.post(f"{api_url}/launch-pod", json={"pod_id": "medium_pod", "cpu": 2})
+        if pod3_response.status_code != 200:
+            print(f"Failed to create 2-core pod for node 2: {pod3_response.text}")
+            return False
+        
+        pod3_data = pod3_response.json()
+        pod3_node = pod3_data.get("node_id")
+        
+        # Get initial pod status
+        time.sleep(2)  # Wait for pods to start
+        status_response = requests.get(f"{api_url}/pod-status")
+        initial_status = status_response.json()
+        print("\nInitial pod status:")
+        print(json.dumps(initial_status, indent=2))
+        
+        # Calculate available capacity for node 2
+        node2_used = 0
+        if node2_id in initial_status:
+            for pod_data in initial_status[node2_id].values():
+                node2_used += pod_data.get("cpu_request", 0)
+        
+        node2_available = 5 - node2_used
+        print(f"Node {node2_id} has {node2_available} cores available")
+        
+        if node2_available < 2:
+            print(f"WARNING: Node {node2_id} doesn't have enough space for the 2-core pod")
+        
+        # Now delete node 1 and check if the 2-core pod gets rescheduled
+        print(f"\nDeleting node {node1_id}...")
+        delete_response = requests.delete(f"{api_url}/delete-node", json={"node_id": node1_id})
+        if delete_response.status_code != 200:
+            print(f"Failed to delete node {node1_id}: {delete_response.text}")
+            return False
+        
+        # Print the deletion response
+        delete_data = delete_response.json()
+        print(f"Delete node response: {json.dumps(delete_data, indent=2)}")
+        
+        # Check if the response contains the expected failures
+        failed_reschedules = delete_data.get("failed_reschedules", [])
+        failed_pod_ids = [item["pod_id"] for item in failed_reschedules]
+        
+        if "large_pod" not in failed_pod_ids:
+            print("ERROR: Expected 6-core pod (large_pod) to fail rescheduling, but it was not reported as failed")
+            succeeded = False
+        else:
+            print("SUCCESS: 6-core pod (large_pod) correctly reported as failed to reschedule")
+            succeeded = True
+        
+        # Wait for rescheduling to complete
+        time.sleep(2)
+        
+        # Get final pod status
+        final_status_response = requests.get(f"{api_url}/pod-status")
+        final_status = final_status_response.json()
+        print("\nFinal pod status after node deletion:")
+        print(json.dumps(final_status, indent=2))
+        
+        # Check if small_pod was rescheduled to node 2
+        small_pod_found = False
+        for node_id, pods in final_status.items():
+            if "small_pod" in pods:
+                small_pod_found = True
+                if node_id == node2_id:
+                    print(f"SUCCESS: 2-core pod (small_pod) was correctly rescheduled to node {node2_id}")
+                    succeeded = succeeded and True
+                else:
+                    print(f"ERROR: 2-core pod (small_pod) was rescheduled to unexpected node {node_id}")
+                    succeeded = False
+        
+        if not small_pod_found:
+            print("ERROR: 2-core pod (small_pod) was not found in final pod status")
+            if "small_pod" in failed_pod_ids:
+                print("ERROR: 2-core pod (small_pod) was incorrectly reported as failed to reschedule")
+            succeeded = False
+        
+        if succeeded:
+            print("\nSUCCESS: Partial rescheduling test passed!")
+            return True
+        else:
+            print("\nFAILURE: Partial rescheduling test failed!")
+            return False
+    
+    except Exception as e:
+        print(f"Test failed with error: {e}")
+        return False
+    finally:
+        # Clean up
+        print("Stopping application...")
+        app_process.terminate()
+        app_process.wait(timeout=5)
+        cleanup_containers()
 
-if __name__ == '__main__':
-    unittest.main() 
+if __name__ == "__main__":
+    # Create a parser for command-line arguments
+    parser = argparse.ArgumentParser(description="Run tests for pod rescheduling")
+    parser.add_argument("--test", type=str, choices=["basic", "partial", "all"], 
+                        default="all", help="Specify which test to run")
+    
+    args = parser.parse_args()
+    
+    if args.test == "basic" or args.test == "all":
+        success = test_pod_rescheduling()
+        
+    if args.test == "partial" or args.test == "all":
+        success = test_partial_rescheduling()
+        
+    sys.exit(0 if success else 1) 
