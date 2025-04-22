@@ -11,6 +11,13 @@ export interface Pod {
   cpu_request: number;
 }
 
+export interface PendingPod {
+  pod_id: string;
+  cpu_request: number;
+  origin_node: string;
+  waiting_since: number;
+}
+
 export interface Node {
   node_id: string;
   healthy: boolean;
@@ -22,6 +29,7 @@ export interface Node {
 export interface ClusterStatus {
   nodes: Node[];
   pods: Pod[];
+  pendingPods: PendingPod[];
   totalCpuUsage: number;
   totalCpuRequested: number;
   autoScaleEnabled: boolean;
@@ -103,15 +111,23 @@ export const api = {
     return response.data;
   },
 
+  // Get pending pods
+  async getPendingPods() {
+    const response = await apiClient.get('/pending-pods');
+    return response.data.pending_pods as PendingPod[];
+  },
+
   // Get cluster status (combined data)
   async getClusterStatus(): Promise<ClusterStatus> {
-    const [nodesResponse, podsResponse, config] = await Promise.all([
+    const [nodesResponse, podsResponse, pendingPodsResponse, config] = await Promise.all([
       this.listNodes(),
       this.getPodStatus(),
+      this.getPendingPods().catch(() => []), // Handle case if endpoint not available yet
       this.getConfig()
     ]);
 
     const nodes = nodesResponse;
+    const pendingPods = pendingPodsResponse;
     
     // Format pods data
     const pods: Pod[] = [];
@@ -126,13 +142,14 @@ export const api = {
         const pod: Pod = {
           pod_id: podId,
           node_id: nodeId,
-          cpu_usage: podData.cpu_usage,
+          cpu_usage: podData.healthy ? podData.cpu_usage : 0, // Show 0 for unhealthy pods
           healthy: podData.healthy,
           cpu_request: podData.cpu_request || 1 // Use the backend provided value with fallback
         };
         
         pods.push(pod);
-        totalCpuUsage += podData.cpu_usage;
+        // Only count CPU usage from healthy pods
+        totalCpuUsage += podData.healthy ? podData.cpu_usage : 0;
         totalCpuRequested += podData.cpu_request || 1; // Use actual request value, not an approximation
       }
     }
@@ -140,6 +157,7 @@ export const api = {
     return {
       nodes,
       pods,
+      pendingPods,
       totalCpuUsage,
       totalCpuRequested,
       autoScaleEnabled: config.AUTO_SCALE,

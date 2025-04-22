@@ -130,10 +130,24 @@ const NodeManager: React.FC = () => {
       setIsDeletingNode(true);
       setError(null);
       
-      await api.deleteNode(selectedNodeId);
+      const response = await api.deleteNode(selectedNodeId);
       
-      // Show success notification
-      notifyNodeDeleted(selectedNodeId);
+      // Show detailed notification based on pod rescheduling status
+      if (response && response.partial_rescheduling === true) {
+        // Some pods couldn't be rescheduled
+        const rescheduledCount = response.rescheduled_pods_count || 0;
+        const pendingCount = response.pending_pods_count || 0;
+        const message = `Node ${selectedNodeId} deleted. ${rescheduledCount} pods rescheduled, ${pendingCount} pods queued due to insufficient resources.`;
+        notifyNodeDeleted(selectedNodeId, message);
+      } else if (response && response.rescheduled_pods_count) {
+        // All pods were successfully rescheduled
+        const rescheduledCount = response.rescheduled_pods_count || 0;
+        const message = `Node ${selectedNodeId} deleted. All ${rescheduledCount} pods successfully rescheduled.`;
+        notifyNodeDeleted(selectedNodeId, message);
+      } else {
+        // No pods needed rescheduling
+        notifyNodeDeleted(selectedNodeId);
+      }
       
       // Refresh the node list
       const [nodesData, podData] = await Promise.all([
@@ -364,8 +378,9 @@ const NodeManager: React.FC = () => {
                     {nodes.map((node) => {
                       const nodePods = podStatus[node.node_id] || {};
                       const podCount = Object.keys(nodePods).length;
+                      // Only count CPU usage from healthy pods or use value 0 for unhealthy pods
                       const cpuUsage = Object.values(nodePods).reduce(
-                        (total, pod) => total + pod.cpu_usage,
+                        (total, pod) => total + (pod.healthy ? pod.cpu_usage : 0),
                         0
                       );
                       const avgPerformance = podCount > 0 ? cpuUsage / podCount : 0;

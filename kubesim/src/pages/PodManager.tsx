@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { api, Pod } from '../services/api';
+import { api, Pod, PendingPod } from '../services/api';
 import { Button } from '../components/ui/button';
 import { Badge } from '../components/ui/badge';
 import {
@@ -10,13 +10,14 @@ import {
   CardDescription,
   CardFooter,
 } from '../components/ui/card';
-import { Play, Square, RefreshCw, AlertTriangle, Check, LineChart } from 'lucide-react';
+import { Play, Square, RefreshCw, AlertTriangle, Check, LineChart, Clock, ArchiveIcon } from 'lucide-react';
 import useUsageHistory from '../hooks/useUsageHistory';
 import UsageChartModal from '../components/UsageChartModal';
 import { notifyPodLaunched, notifyPodTerminated, notifyPodError } from '../lib/toast';
 
 const PodManager: React.FC = () => {
   const [pods, setPods] = useState<Pod[]>([]);
+  const [pendingPods, setPendingPods] = useState<PendingPod[]>([]);
   const [nodes, setNodes] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -43,12 +44,14 @@ const PodManager: React.FC = () => {
     const fetchData = async () => {
       try {
         setLoading(true);
-        const [nodesData, podStatus] = await Promise.all([
+        const [nodesData, podStatus, pendingPodsData] = await Promise.all([
           api.listNodes(),
           api.getPodStatus(),
+          api.getPendingPods().catch(() => []),
         ]);
         
         setNodes(nodesData);
+        setPendingPods(pendingPodsData);
         
         // Convert pod status to array
         const podArray: Pod[] = [];
@@ -74,7 +77,7 @@ const PodManager: React.FC = () => {
     };
 
     fetchData();
-    const interval = setInterval(fetchData, 3000); // Poll every 1s
+    const interval = setInterval(fetchData, 3000); // Poll every 3s
     return () => clearInterval(interval);
   }, []);
 
@@ -91,12 +94,14 @@ const PodManager: React.FC = () => {
       const response = await api.launchPod(podName || undefined, intCpuRequest);
       
       // Refresh pod data
-      const [nodesData, podStatus] = await Promise.all([
+      const [nodesData, podStatus, pendingPodsData] = await Promise.all([
         api.listNodes(),
         api.getPodStatus(),
+        api.getPendingPods().catch(() => []),
       ]);
       
       setNodes(nodesData);
+      setPendingPods(pendingPodsData);
       
       // Convert pod status to array
       const podArray: Pod[] = [];
@@ -154,6 +159,20 @@ const PodManager: React.FC = () => {
   const showPodChart = (pod: Pod) => {
     setSelectedPod(pod);
     setIsChartModalOpen(true);
+  };
+
+  // Format timestamp to human-readable time
+  const formatWaitTime = (timestamp: number) => {
+    const now = Date.now() / 1000; // Convert to seconds
+    const waitTime = now - timestamp;
+    
+    if (waitTime < 60) {
+      return `${Math.floor(waitTime)} seconds`;
+    } else if (waitTime < 3600) {
+      return `${Math.floor(waitTime / 60)} minutes`;
+    } else {
+      return `${Math.floor(waitTime / 3600)} hours, ${Math.floor((waitTime % 3600) / 60)} minutes`;
+    }
   };
 
   return (
@@ -235,7 +254,7 @@ const PodManager: React.FC = () => {
         </div>
       )}
 
-      <Card>
+      <Card className="mb-8">
         <CardHeader className="flex flex-row items-center justify-between">
           <div>
             <CardTitle>Running Pods</CardTitle>
@@ -290,7 +309,7 @@ const PodManager: React.FC = () => {
                           <span 
                             className={`mr-2 ${pod.cpu_usage > pod.cpu_request ? "text-red-500 font-semibold" : ""}`}
                           >
-                            {pod.cpu_usage.toFixed(2)} / {pod.cpu_request} cores
+                            {pod.healthy ? pod.cpu_usage.toFixed(2) : 0} / {pod.cpu_request} cores
                             {pod.cpu_usage > pod.cpu_request && (
                               <span className="text-xs ml-1">(Limit exceeded)</span>
                             )}
@@ -333,6 +352,77 @@ const PodManager: React.FC = () => {
               </table>
             </div>
           )}
+        </CardContent>
+      </Card>
+
+      {/* Pending Pods Section */}
+      <Card className="mb-8">
+        <CardHeader>
+          <CardTitle className="flex items-center">
+            <Clock className="h-5 w-5 mr-2" />
+            Pending Pods
+          </CardTitle>
+          <CardDescription>
+            Pods waiting to be scheduled when resources become available
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {loading && pendingPods.length === 0 ? (
+            <div className="flex justify-center p-6">
+              <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-primary"></div>
+            </div>
+          ) : pendingPods.length === 0 ? (
+            <div className="text-center py-6">
+              <h3 className="text-lg font-medium mb-2">No Pending Pods</h3>
+              <p className="text-gray-600 dark:text-gray-400">
+                All pods are currently scheduled and running.
+              </p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b dark:border-gray-700">
+                    <th className="py-3 px-4">Pod ID</th>
+                    <th className="py-3 px-4">CPU Request</th>
+                    <th className="py-3 px-4">Origin Node</th>
+                    <th className="py-3 px-4">Waiting Since</th>
+                    <th className="py-3 px-4">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pendingPods.map((pod) => (
+                    <tr key={pod.pod_id} className="border-b dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800">
+                      <td className="py-3 px-4 font-medium">{pod.pod_id}</td>
+                      <td className="py-3 px-4">{pod.cpu_request} cores</td>
+                      <td className="py-3 px-4">{pod.origin_node}</td>
+                      <td className="py-3 px-4">{formatWaitTime(pod.waiting_since)}</td>
+                      <td className="py-3 px-4">
+                        <Badge variant="secondary" className="bg-amber-100 dark:bg-amber-900 text-amber-800 dark:text-amber-200">
+                          <span className="flex items-center">
+                            <Clock className="h-3 w-3 mr-1" />
+                            Pending
+                          </span>
+                        </Badge>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div className="mt-4 p-4 bg-blue-50 dark:bg-blue-900/20 text-blue-800 dark:text-blue-200 rounded-md">
+            <h4 className="text-sm font-medium flex items-center mb-2">
+              <ArchiveIcon className="h-4 w-4 mr-2" />
+              How Pending Pods Work
+            </h4>
+            <p className="text-sm">
+              When a node is deleted or fails, pods that cannot be immediately rescheduled due to 
+              insufficient resources are placed in a pending queue. When new nodes are added or 
+              resources become available, these pods will be automatically rescheduled based on 
+              their requirements.
+            </p>
+          </div>
         </CardContent>
       </Card>
 

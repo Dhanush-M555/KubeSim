@@ -67,8 +67,9 @@ export const notifyNodeAdded = (nodeId: string, cores: number) => {
   toast.success(`Node ${nodeId} with ${cores} cores added successfully! 🚀`, successOptions);
 };
 
-export const notifyNodeDeleted = (nodeId: string) => {
-  toast.info(`Node ${nodeId} has been removed from the cluster 🗑️`, infoOptions);
+export const notifyNodeDeleted = (nodeId: string, customMessage?: string) => {
+  const message = customMessage || `Node ${nodeId} has been removed from the cluster 🗑️`;
+  toast.info(message, infoOptions);
 };
 
 export const notifyNodeError = (message: string) => {

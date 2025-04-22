@@ -71,10 +71,10 @@ def poll_metrics():
                             try:
                                 is_healthy = node_health.get(pod_id, True)
                                 
-                                # Set cpu_usage to -1 when pod is unhealthy for better visualization on graphs
+                                # Set cpu_usage to 0 when pod is unhealthy (previously was -1)
                                 cpu_usage = pod_metrics.get("cpu_usage", 0)
                                 if not is_healthy:
-                                    cpu_usage = -1
+                                    cpu_usage = 0
                                 
                                 cached_status[node_id][pod_id] = {
                                     "cpu_usage": cpu_usage,
@@ -92,8 +92,8 @@ def poll_metrics():
                     if node_id in cached_status:
                         for pod_id in cached_status[node_id]:
                             cached_status[node_id][pod_id]["healthy"] = False
-                            # Set cpu_usage to -1 for unhealthy pods
-                            cached_status[node_id][pod_id]["cpu_usage"] = -1
+                            # Set cpu_usage to 0 for unhealthy pods (previously was -1)
+                            cached_status[node_id][pod_id]["cpu_usage"] = 0
         
         # Auto-scaling check
         if AUTO_SCALE:
@@ -114,9 +114,8 @@ def check_auto_scaling():
                 
                 # Calculate node CPU usage
                 node_pods = cached_status.get(node_id, {})
-                # Sum CPU usage only for healthy pods (where cpu_usage is not -1)
-                node_cpu = sum(pod["cpu_usage"] for pod in node_pods.values() 
-                              if pod["cpu_usage"] >= 0)
+                # Sum CPU usage for all pods - unhealthy pods already have usage set to 0
+                node_cpu = sum(pod["cpu_usage"] for pod in node_pods.values())
                 
                 total_cpu_usage += node_cpu
                 total_capacity += node_capacity

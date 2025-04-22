@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { api, Node } from '../services/api';
+import { api, Node, PendingPod } from '../services/api';
 import { Button } from '../components/ui/button';
 import { Badge } from '../components/ui/badge';
 import {
@@ -9,8 +9,10 @@ import {
   CardHeader,
   CardTitle,
   CardDescription,
+  CardFooter,
 } from '../components/ui/card';
 import { ClusterNotifications } from '../components/ClusterNotifications';
+import { Clock, AlertTriangle } from 'lucide-react';
 
 // Heartbeat status indicator component
 const HeartbeatIndicator = ({ lastHeartbeat }: { lastHeartbeat: number }) => {
@@ -32,6 +34,7 @@ const HeartbeatIndicator = ({ lastHeartbeat }: { lastHeartbeat: number }) => {
 const Dashboard: React.FC = () => {
   const [nodes, setNodes] = useState<Node[]>([]);
   const [podStatus, setPodStatus] = useState<Record<string, Record<string, any>>>({});
+  const [pendingPods, setPendingPods] = useState<PendingPod[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [autoScaleEnabled, setAutoScaleEnabled] = useState(false);
@@ -47,6 +50,7 @@ const Dashboard: React.FC = () => {
         ]);
         setNodes(nodesData);
         setPodStatus(podData);
+        setPendingPods(clusterStatus.pendingPods || []);
         setAutoScaleEnabled(clusterStatus.autoScaleEnabled);
       } catch (err) {
         setError('Failed to fetch cluster data');
@@ -92,15 +96,24 @@ const Dashboard: React.FC = () => {
           <CardDescription>Current status of your cluster</CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div className="p-4 bg-gray-50 dark:bg-gray-800 rounded-lg">
               <div className="text-sm font-medium text-gray-500 dark:text-gray-400">Active Nodes</div>
               <div className="text-3xl font-bold mt-1">{nodes.filter(node => node.healthy).length}/{nodes.length}</div>
             </div>
             <div className="p-4 bg-gray-50 dark:bg-gray-800 rounded-lg">
-              <div className="text-sm font-medium text-gray-500 dark:text-gray-400">Total Pods</div>
+              <div className="text-sm font-medium text-gray-500 dark:text-gray-400">Running Pods</div>
               <div className="text-3xl font-bold mt-1">
                 {Object.values(podStatus).reduce((count, nodePods) => count + Object.keys(nodePods).length, 0)}
+              </div>
+            </div>
+            <div className={`p-4 bg-gray-50 dark:bg-gray-800 rounded-lg ${pendingPods.length > 0 ? 'bg-amber-50 dark:bg-amber-900/20' : ''}`}>
+              <div className="text-sm font-medium text-gray-500 dark:text-gray-400 flex items-center">
+                Pending Pods
+                {pendingPods.length > 0 && <Clock className="h-4 w-4 ml-1 text-amber-500" />}
+              </div>
+              <div className={`text-3xl font-bold mt-1 ${pendingPods.length > 0 ? 'text-amber-600 dark:text-amber-400' : ''}`}>
+                {pendingPods.length}
               </div>
             </div>
             <div className="p-4 bg-gray-50 dark:bg-gray-800 rounded-lg">
@@ -112,6 +125,54 @@ const Dashboard: React.FC = () => {
           </div>
         </CardContent>
       </Card>
+
+      {/* Pending Pods Warning Card */}
+      {pendingPods.length > 0 && (
+        <Card className="mb-8 border-amber-300 dark:border-amber-700">
+          <CardHeader className="bg-amber-50 dark:bg-amber-900/20">
+            <CardTitle className="flex items-center text-amber-800 dark:text-amber-200">
+              <AlertTriangle className="h-5 w-5 mr-2 text-amber-600 dark:text-amber-400" />
+              Pending Pods Detected
+            </CardTitle>
+            <CardDescription className="text-amber-700 dark:text-amber-300">
+              There are {pendingPods.length} pod(s) waiting to be rescheduled due to insufficient cluster resources
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="pt-4">
+            <p className="text-sm">
+              These pods were previously running but couldn't be rescheduled after a node was deleted. 
+              They are waiting in a queue and will be automatically rescheduled when resources become available.
+            </p>
+            <div className="mt-4">
+              <strong className="font-medium">Pending pods:</strong>
+              <ul className="list-disc list-inside mt-2 pl-2">
+                {pendingPods.slice(0, 3).map(pod => (
+                  <li key={pod.pod_id} className="text-sm">
+                    <span className="font-medium">{pod.pod_id}</span> ({pod.cpu_request} cores) from {pod.origin_node}
+                  </li>
+                ))}
+                {pendingPods.length > 3 && (
+                  <li className="text-sm italic">And {pendingPods.length - 3} more...</li>
+                )}
+              </ul>
+            </div>
+          </CardContent>
+          <CardFooter className="bg-amber-50/50 dark:bg-amber-900/10">
+            <div className="flex space-x-4">
+              <Link to="/pod-manager">
+                <Button variant="secondary" className="bg-amber-100 hover:bg-amber-200 dark:bg-amber-800 dark:hover:bg-amber-700">
+                  View All Pending Pods
+                </Button>
+              </Link>
+              <Link to="/nodes">
+                <Button variant="outline">
+                  Add Node
+                </Button>
+              </Link>
+            </div>
+          </CardFooter>
+        </Card>
+      )}
 
       <Card>
         <CardHeader>
